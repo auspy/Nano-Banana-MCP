@@ -15,6 +15,10 @@ yarn-error.log*
 
 # Configuration files with sensitive data
 .nano-banana-config.json
+.mcp.json
+
+# Generated images
+generated_imgs/
 
 # Test files
 coverage/

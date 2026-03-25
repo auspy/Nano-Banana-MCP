@@ -27,18 +27,20 @@ const ConfigSchema = z.object({
 
 type Config = z.infer<typeof ConfigSchema>;
 
+const DEFAULT_MODEL = "gemini-2.5-flash-image";
+
 class NanoBananaMCP {
   private server: Server;
   private genAI: GoogleGenAI | null = null;
   private config: Config | null = null;
   private lastImagePath: string | null = null;
-  private configSource: 'environment' | 'config_file' | 'not_configured' = 'not_configured';
+  private configSource: 'environment' | 'not_configured' = 'not_configured';
 
   constructor() {
     this.server = new Server(
       {
         name: "nano-banana-mcp",
-        version: "1.0.0",
+        version: "1.0.3",
       },
       {
         capabilities: {
@@ -78,6 +80,14 @@ class NanoBananaMCP {
                   type: "string",
                   description: "Text prompt describing the NEW image to create from scratch",
                 },
+                model: {
+                  type: "string",
+                  description: `Gemini model to use (default: ${DEFAULT_MODEL}). Examples: gemini-2.5-flash-preview-05-20, gemini-2.5-pro-preview-05-06`,
+                },
+                outputDir: {
+                  type: "string",
+                  description: "Absolute path to directory where generated images will be saved. Directory will be created if it doesn't exist.",
+                },
               },
               required: ["prompt"],
             },
@@ -102,6 +112,14 @@ class NanoBananaMCP {
                     type: "string"
                   },
                   description: "Optional array of file paths to additional reference images to use during editing (e.g., for style transfer, adding elements, etc.)",
+                },
+                model: {
+                  type: "string",
+                  description: `Gemini model to use (default: ${DEFAULT_MODEL})`,
+                },
+                outputDir: {
+                  type: "string",
+                  description: "Absolute path to directory where edited images will be saved. Directory will be created if it doesn't exist.",
                 },
               },
               required: ["imagePath", "prompt"],
@@ -132,6 +150,14 @@ class NanoBananaMCP {
                     type: "string"
                   },
                   description: "Optional array of file paths to additional reference images to use during editing (e.g., for style transfer, adding elements from other images, etc.)",
+                },
+                model: {
+                  type: "string",
+                  description: `Gemini model to use (default: ${DEFAULT_MODEL})`,
+                },
+                outputDir: {
+                  type: "string",
+                  description: "Absolute path to directory where edited images will be saved. Directory will be created if it doesn't exist.",
                 },
               },
               required: ["prompt"],
@@ -191,15 +217,13 @@ class NanoBananaMCP {
       
       this.config = { geminiApiKey: apiKey };
       this.genAI = new GoogleGenAI({ apiKey });
-      this.configSource = 'config_file'; // Manual configuration via tool
-      
-      await this.saveConfig();
-      
+      this.configSource = 'environment'; // Runtime configuration via tool (in-memory only)
+
       return {
         content: [
           {
             type: "text",
-            text: "✅ Gemini API token configured successfully! You can now use nano-banana image generation features.",
+            text: "✅ Gemini API token configured successfully (in-memory only, not persisted to disk). You can now use nano-banana image generation features.",
           },
         ],
       };
@@ -216,21 +240,22 @@ class NanoBananaMCP {
       throw new McpError(ErrorCode.InvalidRequest, "Gemini API token not configured. Use configure_gemini_token first.");
     }
 
-    const { prompt } = request.params.arguments as { prompt: string };
-    
+    const { prompt, model, outputDir } = request.params.arguments as { prompt: string; model?: string; outputDir?: string };
+    const useModel = model || DEFAULT_MODEL;
+
     try {
       const response = await this.genAI!.models.generateContent({
-        model: "gemini-2.5-flash-image-preview",
+        model: useModel,
         contents: prompt,
       });
-      
+
       // Process response to extract image data
       const content: any[] = [];
       const savedFiles: string[] = [];
       let textContent = "";
-      
-      // Get appropriate save directory based on OS
-      const imagesDir = this.getImagesDirectory();
+
+      // Get appropriate save directory
+      const imagesDir = this.getImagesDirectory(outputDir);
       
       // Create directory
       await fs.mkdir(imagesDir, { recursive: true, mode: 0o755 });
@@ -265,7 +290,7 @@ class NanoBananaMCP {
       }
       
       // Build response content
-      let statusText = `🎨 Image generated with nano-banana (Gemini 2.5 Flash Image)!\n\nPrompt: "${prompt}"`;
+      let statusText = `🎨 Image generated with nano-banana (${useModel})!\n\nPrompt: "${prompt}"`;
       
       if (textContent) {
         statusText += `\n\nDescription: ${textContent}`;
@@ -305,13 +330,19 @@ class NanoBananaMCP {
       throw new McpError(ErrorCode.InvalidRequest, "Gemini API token not configured. Use configure_gemini_token first.");
     }
 
-    const { imagePath, prompt, referenceImages } = request.params.arguments as { 
-      imagePath: string; 
-      prompt: string; 
+    const { imagePath, prompt, referenceImages, model, outputDir } = request.params.arguments as {
+      imagePath: string;
+      prompt: string;
       referenceImages?: string[];
+      model?: string;
+      outputDir?: string;
     };
+    const useModel = model || DEFAULT_MODEL;
     
     try {
+      // Validate image path to prevent arbitrary file reads
+      this.validateImagePath(imagePath);
+
       // Prepare the main image
       const imageBuffer = await fs.readFile(imagePath);
       const mimeType = this.getMimeType(imagePath);
@@ -331,10 +362,11 @@ class NanoBananaMCP {
       if (referenceImages && referenceImages.length > 0) {
         for (const refPath of referenceImages) {
           try {
+            this.validateImagePath(refPath);
             const refBuffer = await fs.readFile(refPath);
             const refMimeType = this.getMimeType(refPath);
             const refBase64 = refBuffer.toString('base64');
-            
+
             imageParts.push({
               inlineData: {
                 data: refBase64,
@@ -342,7 +374,7 @@ class NanoBananaMCP {
               }
             });
           } catch (error) {
-            // Continue with other images, don't fail the entire operation
+            console.error(`Skipping reference image "${refPath}": ${error instanceof Error ? error.message : String(error)}`);
             continue;
           }
         }
@@ -353,7 +385,7 @@ class NanoBananaMCP {
       
       // Use new API format with multiple images and text
       const response = await this.genAI!.models.generateContent({
-        model: "gemini-2.5-flash-image-preview",
+        model: useModel,
         contents: [
           {
             parts: imageParts
@@ -367,7 +399,7 @@ class NanoBananaMCP {
       let textContent = "";
       
       // Get appropriate save directory
-      const imagesDir = this.getImagesDirectory();
+      const imagesDir = this.getImagesDirectory(outputDir);
       await fs.mkdir(imagesDir, { recursive: true, mode: 0o755 });
       
       // Extract image from response
@@ -450,24 +482,16 @@ class NanoBananaMCP {
     if (isConfigured) {
       statusText = "✅ Gemini API token is configured and ready to use";
       
-      switch (this.configSource) {
-        case 'environment':
-          sourceInfo = "\n📍 Source: Environment variable (GEMINI_API_KEY)\n💡 This is the most secure configuration method.";
-          break;
-        case 'config_file':
-          sourceInfo = "\n📍 Source: Local configuration file (.nano-banana-config.json)\n💡 Consider using environment variables for better security.";
-          break;
-      }
+      sourceInfo = "\n📍 Source: Environment variable (GEMINI_API_KEY)";
     } else {
       statusText = "❌ Gemini API token is not configured";
       sourceInfo = `
 
-📝 Configuration options (in priority order):
-1. 🥇 MCP client environment variables (Recommended)
-2. 🥈 System environment variable: GEMINI_API_KEY  
-3. 🥉 Use configure_gemini_token tool
+📝 Configuration options:
+1. Set GEMINI_API_KEY environment variable in your MCP client config
+2. Use the configure_gemini_token tool (in-memory only, not persisted)
 
-💡 For the most secure setup, add this to your MCP configuration:
+💡 Add this to your MCP configuration:
 "env": { "GEMINI_API_KEY": "your-api-key-here" }`;
     }
     
@@ -558,6 +582,19 @@ class NanoBananaMCP {
     return this.config !== null && this.genAI !== null;
   }
 
+  private static ALLOWED_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.tif']);
+
+  private validateImagePath(filePath: string): void {
+    const resolved = path.resolve(filePath);
+    const ext = path.extname(resolved).toLowerCase();
+    if (!NanoBananaMCP.ALLOWED_IMAGE_EXTENSIONS.has(ext)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Invalid file type "${ext}". Only image files are allowed: ${[...NanoBananaMCP.ALLOWED_IMAGE_EXTENSIONS].join(', ')}`
+      );
+    }
+  }
+
   private getMimeType(filePath: string): string {
     const ext = path.extname(filePath).toLowerCase();
     switch (ext) {
@@ -568,65 +605,36 @@ class NanoBananaMCP {
         return 'image/png';
       case '.webp':
         return 'image/webp';
+      case '.gif':
+        return 'image/gif';
+      case '.bmp':
+        return 'image/bmp';
+      case '.tiff':
+      case '.tif':
+        return 'image/tiff';
       default:
         return 'image/jpeg';
     }
   }
 
-  private getImagesDirectory(): string {
-    const platform = os.platform();
-    
-    if (platform === 'win32') {
-      // Windows: Use Documents folder
-      const homeDir = os.homedir();
-      return path.join(homeDir, 'Documents', 'nano-banana-images');
-    } else {
-      // macOS/Linux: Use current directory or home directory if in system paths
-      const cwd = process.cwd();
-      const homeDir = os.homedir();
-      
-      // If in system directories, use home directory instead
-      if (cwd.startsWith('/usr/') || cwd.startsWith('/opt/') || cwd.startsWith('/var/')) {
-        return path.join(homeDir, 'nano-banana-images');
-      }
-      
-      return path.join(cwd, 'generated_imgs');
+  private getImagesDirectory(outputDir?: string): string {
+    if (outputDir) {
+      return path.resolve(outputDir);
     }
-  }
-
-  private async saveConfig(): Promise<void> {
-    if (this.config) {
-      const configPath = path.join(process.cwd(), '.nano-banana-config.json');
-      await fs.writeFile(configPath, JSON.stringify(this.config, null, 2));
-    }
+    const homeDir = os.homedir();
+    return path.join(homeDir, 'nano-banana-images');
   }
 
   private async loadConfig(): Promise<void> {
-    // Try to load from environment variable first
     const envApiKey = process.env.GEMINI_API_KEY;
     if (envApiKey) {
       try {
         this.config = ConfigSchema.parse({ geminiApiKey: envApiKey });
         this.genAI = new GoogleGenAI({ apiKey: this.config.geminiApiKey });
         this.configSource = 'environment';
-        return;
-      } catch (error) {
-        // Invalid API key in environment
+      } catch {
+        this.configSource = 'not_configured';
       }
-    }
-    
-    // Fallback to config file
-    try {
-      const configPath = path.join(process.cwd(), '.nano-banana-config.json');
-      const configData = await fs.readFile(configPath, 'utf-8');
-      const parsedConfig = JSON.parse(configData);
-      
-      this.config = ConfigSchema.parse(parsedConfig);
-      this.genAI = new GoogleGenAI({ apiKey: this.config.geminiApiKey });
-      this.configSource = 'config_file';
-    } catch {
-      // Config file doesn't exist or is invalid, that's okay
-      this.configSource = 'not_configured';
     }
   }
 
